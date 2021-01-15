@@ -169,14 +169,13 @@ where
         if self.vertices.contains_key(&message_id) {
             None
         } else {
-            let _gtl_guard = RwLockUpgradableReadGuard::upgrade(gtl_guard).await;
-
             // Insert into backend using hooks
             self.hooks
                 .insert(message_id, message.clone(), metadata.clone())
                 .await
                 .unwrap_or_else(|e| info!("Failed to insert message {:?}", e));
 
+            let _gtl_guard = RwLockUpgradableReadGuard::upgrade(gtl_guard).await;
             self.insert_inner(message_id, message, metadata).await
         }
     }
@@ -266,10 +265,10 @@ where
     /// Updates the metadata of a particular vertex.
     pub async fn set_metadata(&self, message_id: &MessageId, metadata: T) {
         self.pull_message(message_id).await;
+        let gtl_guard = self.gtl.write().await;
         if let Some(mut vtx) = self.vertices.get_mut(message_id) {
-            let _gtl_guard = self.gtl.write().await;
-
             *vtx.value_mut().metadata_mut() = metadata;
+            let _gtl_guard = RwLockWriteGuard::downgrade(gtl_guard);
             self.hooks
                 .insert(*message_id, (&**vtx.message()).clone(), vtx.metadata().clone())
                 .await
@@ -286,9 +285,10 @@ where
 
         let gtl_guard = self.gtl.upgradable_read().await;
         if let Some(mut vtx) = self.vertices.get_mut(message_id) {
-            let _gtl_guard = RwLockUpgradableReadGuard::upgrade(gtl_guard).await;
+            let gtl_guard = RwLockUpgradableReadGuard::upgrade(gtl_guard).await;
 
             update(vtx.value_mut().metadata_mut());
+            let _gtl_guard = RwLockWriteGuard::downgrade(gtl_guard);
             self.hooks
                 .insert(*message_id, (&**vtx.message()).clone(), vtx.metadata().clone())
                 .await
@@ -331,11 +331,10 @@ where
         {
             Some(children) => (children, RwLockUpgradableReadGuard::downgrade(gtl_guard)),
             None => {
-                let gtl_guard = RwLockUpgradableReadGuard::upgrade(gtl_guard).await;
+                let approvers = self.hooks.fetch_approvers(message_id).await;
 
-                self.hooks
-                    .fetch_approvers(message_id)
-                    .await
+                let gtl_guard = RwLockUpgradableReadGuard::upgrade(gtl_guard).await;
+                approvers
                     .unwrap_or_else(|e| {
                         info!("Failed to update approvers for message message {:?}", e);
                         None
@@ -345,9 +344,11 @@ where
                             .insert(*message_id, (approvers.into_iter().collect(), true))
                     });
 
+                let gtl_guard = RwLockWriteGuard::downgrade(gtl_guard);
+
                 (self.children
                     .get(message_id)
-                    .expect("Approver list inserted and immediately evicted"), RwLockWriteGuard::downgrade(gtl_guard))
+                    .expect("Approver list inserted and immediately evicted"), gtl_guard)
             }
         };
 
@@ -383,9 +384,8 @@ where
         if self.vertices.contains_key(message_id) {
             true
         } else {
-            let _gtl_guard = RwLockUpgradableReadGuard::upgrade(gtl_guard).await;
-
             if let Ok(Some((tx, metadata))) = self.hooks.get(message_id).await {
+                let _gtl_guard = RwLockUpgradableReadGuard::upgrade(gtl_guard).await;
                 self.insert_inner(*message_id, tx, metadata).await;
                 true
             } else {
