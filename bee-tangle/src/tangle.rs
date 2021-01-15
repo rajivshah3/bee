@@ -141,8 +141,6 @@ where
         let r = match self.vertices.entry(message_id) {
             Entry::Occupied(_) => None,
             Entry::Vacant(entry) => {
-                self.add_child_inner(*message.parent1(), message_id).await;
-                self.add_child_inner(*message.parent2(), message_id).await;
                 let vtx = Vertex::new(message, metadata);
                 let tx = vtx.message().clone();
                 entry.insert(vtx);
@@ -156,8 +154,6 @@ where
                 Some(tx)
             }
         };
-
-        self.perform_eviction().await;
 
         r
     }
@@ -176,7 +172,15 @@ where
                 .unwrap_or_else(|e| info!("Failed to insert message {:?}", e));
 
             let _gtl_guard = RwLockUpgradableReadGuard::upgrade(gtl_guard).await;
-            self.insert_inner(message_id, message, metadata).await
+            let p1 = *message.parent1();
+            let p2 = *message.parent2();
+            let m = self.insert_inner(message_id, message, metadata).await;
+            self.add_child_inner(p1, message_id).await;
+            self.add_child_inner(p2, message_id).await;
+
+            self.perform_eviction().await;
+
+            m
         }
     }
 
