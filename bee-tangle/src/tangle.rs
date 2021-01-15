@@ -5,7 +5,7 @@ use crate::{vertex::Vertex, MessageRef};
 
 use bee_message::{Message, MessageId};
 
-use async_rwlock::RwLock;
+use async_rwlock::{RwLock, RwLockUpgradableReadGuard, RwLockReadGuard, RwLockWriteGuard};
 use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use log::info;
@@ -164,10 +164,12 @@ where
 
     /// Inserts a message, and returns a thread-safe reference to it in case it didn't already exist.
     pub async fn insert(&self, message_id: MessageId, message: Message, metadata: T) -> Option<MessageRef> {
-        if self.contains_inner(&message_id) {
+        let gtl_guard = self.gtl.upgradable_read().await;
+
+        if self.vertices.contains_key(&message_id) {
             None
         } else {
-            let _gtl_guard = self.gtl.write().await;
+            let _gtl_guard = RwLockUpgradableReadGuard::upgrade(gtl_guard).await;
 
             // Insert into backend using hooks
             self.hooks
@@ -196,7 +198,21 @@ where
         // .unwrap_or_else(|e| info!("Failed to update approvers for message message {:?}", e));
     }
 
-    fn get_inner(&self, message_id: &MessageId) -> Option<impl Deref<Target = Vertex<T>> + '_> {
+    async fn get_inner(&self, message_id: &MessageId) -> Option<impl Deref<Target = Vertex<T>> + '_> {
+        struct VertexWrapper<'a, T: Clone> {
+            vtx: dashmap::mapref::one::Ref<'a, MessageId, Vertex<T>>,
+            _guard: RwLockReadGuard<'a, ()>,
+        }
+
+        impl<'a, T: Clone> Deref for VertexWrapper<'a, T> {
+            type Target = Vertex<T>;
+
+            fn deref(&self) -> &Self::Target {
+                self.vtx.deref()
+            }
+        }
+
+        let gtl_guard = self.gtl.read().await;
         self.vertices.get(message_id).map(|vtx| {
             let mut cache_queue = self.cache_queue.lock().unwrap();
             // Update message_id priority
@@ -209,7 +225,10 @@ where
             };
             *entry.unwrap() = self.generate_cache_index();
 
-            vtx
+            VertexWrapper {
+                vtx,
+                _guard: gtl_guard,
+            }
         })
     }
 
@@ -217,30 +236,31 @@ where
     pub async fn get(&self, message_id: &MessageId) -> Option<MessageRef> {
         self.pull_message(message_id).await;
 
-        self.get_inner(message_id).map(|v| v.message().clone())
+        self.get_inner(message_id).await.map(|v| v.message().clone())
     }
 
-    fn contains_inner(&self, message_id: &MessageId) -> bool {
+    async fn contains_inner(&self, message_id: &MessageId) -> bool {
+        let _gtl_guard = self.gtl.read().await;
         self.vertices.contains_key(message_id)
     }
 
     /// Returns whether the message is stored in the Tangle.
     pub async fn contains(&self, message_id: &MessageId) -> bool {
-        self.contains_inner(message_id) || self.pull_message(message_id).await
+        self.contains_inner(message_id).await || self.pull_message(message_id).await
     }
 
     /// Get the metadata of a vertex associated with the given `message_id`.
     pub async fn get_metadata(&self, message_id: &MessageId) -> Option<T> {
         self.pull_message(message_id).await;
 
-        self.get_inner(message_id).map(|v| v.metadata().clone())
+        self.get_inner(message_id).await.map(|v| v.metadata().clone())
     }
 
     /// Get the metadata of a vertex associated with the given `message_id`.
     pub async fn get_vertex(&self, message_id: &MessageId) -> Option<impl Deref<Target = Vertex<T>> + '_> {
         self.pull_message(message_id).await;
 
-        self.get_inner(message_id)
+        self.get_inner(message_id).await
     }
 
     /// Updates the metadata of a particular vertex.
@@ -263,8 +283,10 @@ where
         Update: FnMut(&mut T),
     {
         self.pull_message(message_id).await;
+
+        let gtl_guard = self.gtl.upgradable_read().await;
         if let Some(mut vtx) = self.vertices.get_mut(message_id) {
-            let _gtl_guard = self.gtl.write().await;
+            let _gtl_guard = RwLockUpgradableReadGuard::upgrade(gtl_guard).await;
 
             update(vtx.value_mut().metadata_mut());
             self.hooks
@@ -288,6 +310,7 @@ where
     async fn children_inner(&self, message_id: &MessageId) -> Option<impl Deref<Target = HashSet<MessageId>> + '_> {
         struct Children<'a> {
             children: dashmap::mapref::one::Ref<'a, MessageId, (HashSet<MessageId>, bool)>,
+            _guard: RwLockReadGuard<'a, ()>,
         }
 
         impl<'a> Deref for Children<'a> {
@@ -298,15 +321,17 @@ where
             }
         }
 
-        let children = match self
+        let gtl_guard = self.gtl.upgradable_read().await;
+
+        let (children, guard) = match self
             .children
             .get(message_id)
             // Skip approver lists that are not exhaustive
             .filter(|children| children.1)
         {
-            Some(children) => children,
+            Some(children) => (children, RwLockUpgradableReadGuard::downgrade(gtl_guard)),
             None => {
-                let _gtl_guard = self.gtl.write().await;
+                let gtl_guard = RwLockUpgradableReadGuard::upgrade(gtl_guard).await;
 
                 self.hooks
                     .fetch_approvers(message_id)
@@ -320,13 +345,13 @@ where
                             .insert(*message_id, (approvers.into_iter().collect(), true))
                     });
 
-                self.children
+                (self.children
                     .get(message_id)
-                    .expect("Approver list inserted and immediately evicted")
+                    .expect("Approver list inserted and immediately evicted"), RwLockWriteGuard::downgrade(gtl_guard))
             }
         };
 
-        Some(Children { children })
+        Some(Children { children, _guard: guard })
     }
 
     /// Returns the children of a vertex, if we know about them.
@@ -353,11 +378,12 @@ where
 
     // Attempts to pull the message from the storage, returns true if successful.
     async fn pull_message(&self, message_id: &MessageId) -> bool {
+        let gtl_guard = self.gtl.upgradable_read().await;
         // If the tangle already contains the tx, do no more work
         if self.vertices.contains_key(message_id) {
             true
         } else {
-            let _gtl_guard = self.gtl.write().await;
+            let _gtl_guard = RwLockUpgradableReadGuard::upgrade(gtl_guard).await;
 
             if let Ok(Some((tx, metadata))) = self.hooks.get(message_id).await {
                 self.insert_inner(*message_id, tx, metadata).await;
