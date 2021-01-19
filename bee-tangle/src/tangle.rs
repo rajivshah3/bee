@@ -133,24 +133,28 @@ where
     }
 
     async fn insert_inner(&self, message_id: MessageId, message: Message, metadata: T) -> Option<MessageRef> {
-        let r = match self.vertices.write().await.entry(message_id) {
-            Entry::Occupied(_) => None,
+        let parents = [*message.parent1(), *message.parent2()];
+
+        let (r, inserted) = match self.vertices.write().await.entry(message_id) {
+            Entry::Occupied(_) => (None, false),
             Entry::Vacant(entry) => {
-                self.add_child_inner(*message.parent1(), message_id).await;
-                self.add_child_inner(*message.parent2(), message_id).await;
                 let vtx = Vertex::new(message, metadata);
                 let tx = vtx.message().clone();
                 entry.insert(vtx);
 
-                // Insert cache queue entry to track eviction priority
-                self.cache_queue
-                    .lock()
-                    .await
-                    .put(message_id, self.generate_cache_index());
-
-                Some(tx)
+                (Some(tx), true)
             }
         };
+
+        if inserted {
+            // Insert cache queue entry to track eviction priority
+            self.cache_queue
+                .lock()
+                .await
+                .put(message_id, self.generate_cache_index());
+
+            self.add_children_inner(&parents, message_id).await;
+        }
 
         self.perform_eviction().await;
 
@@ -175,21 +179,27 @@ where
     }
 
     #[inline]
-    async fn add_child_inner(&self, parent: MessageId, child: MessageId) {
+    async fn add_children_inner(&self, parents: &[MessageId], child: MessageId) {
         let mut children_map = self.children.write().await;
-        let children = children_map
-            .entry(parent)
-            .or_insert_with(|| (HashSet::default(), false));
-        children.0.insert(child);
+        for &parent in parents {
+            let children = children_map
+                .entry(parent)
+                .or_insert_with(|| (HashSet::default(), false));
+            children.0.insert(child);
+        }
+
         drop(children_map);
-        self.hooks
-            .insert_approver(parent, child)
-            .await
-            .unwrap_or_else(|e| info!("Failed to update approvers for message {:?}", e));
-        // self.hooks
-        // .update_approvers(parent, &children.iter().copied().collect::<Vec<_>>())
-        // .await
-        // .unwrap_or_else(|e| info!("Failed to update approvers for message message {:?}", e));
+
+        for &parent in parents {
+            self.hooks
+                .insert_approver(parent, child)
+                .await
+                .unwrap_or_else(|e| info!("Failed to update approvers for message {:?}", e));
+            // self.hooks
+            // .update_approvers(parent, &children.iter().copied().collect::<Vec<_>>())
+            // .await
+            // .unwrap_or_else(|e| info!("Failed to update approvers for message message {:?}", e));
+        }
     }
 
     async fn get_inner(&self, message_id: &MessageId) -> Option<impl Deref<Target = Vertex<T>> + '_> {
