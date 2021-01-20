@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use log::info;
 use lru::LruCache;
 use tokio::sync::{RwLock as TRwLock, RwLockReadGuard as TRwLockReadGuard};
-use spin::Mutex;
+use spin::RwLock;
 
 use std::{
     // collections::HashSet,
@@ -91,7 +91,7 @@ where
     children: Arc<HashMap<MessageId, (HashSet<MessageId>, bool)>>,
 
     pub(crate) cache_counter: AtomicU64,
-    pub(crate) cache_queue: Mutex<LruCache<MessageId, u64>>,
+    pub(crate) cache_queue: RwLock<LruCache<MessageId, u64>>,
 
     pub(crate) hooks: H,
 }
@@ -118,7 +118,7 @@ where
             children: Arc::new(HashMap::new()),
 
             cache_counter: AtomicU64::new(0),
-            cache_queue: Mutex::new(LruCache::new(CACHE_LEN + 1)),
+            cache_queue: RwLock::new(LruCache::new(CACHE_LEN + 1)),
 
             hooks,
         }
@@ -127,7 +127,7 @@ where
     /// Create a new tangle with the given capacity.
     pub fn with_capacity(self, cap: usize) -> Self {
         Self {
-            cache_queue: Mutex::new(LruCache::new(cap + 1)),
+            cache_queue: RwLock::new(LruCache::new(cap + 1)),
             ..self
         }
     }
@@ -145,9 +145,10 @@ where
 
         if self.vertices.insert(message_id, vtx).await.is_none() {
             // Insert cache queue entry to track eviction priority
+            let idx = self.generate_cache_index();
             self.cache_queue
-                .lock()
-                .put(message_id, self.generate_cache_index());
+                .write()
+                .put(message_id, idx);
 
             self.add_children_inner(&parents, message_id).await;
         }
@@ -201,7 +202,8 @@ where
         let res = self.vertices.get(message_id).await;
 
         if res.is_some() {
-            let mut cache_queue = self.cache_queue.lock();
+            let idx = self.generate_cache_index();
+            let mut cache_queue = self.cache_queue.write();
             // Update message_id priority
             let entry = cache_queue.get_mut(message_id);
             let entry = if entry.is_none() {
@@ -210,7 +212,7 @@ where
             } else {
                 entry
             };
-            *entry.unwrap() = self.generate_cache_index();
+            *entry.unwrap() = idx;
         }
 
         res
@@ -406,14 +408,14 @@ where
     async fn perform_eviction(&self) {
         const CACHE_THRESHOLD: usize = 1024;
 
-        if self.len().await < self.cache_queue.lock().cap() + CACHE_THRESHOLD {
+        if self.len().await < self.cache_queue.read().cap() + CACHE_THRESHOLD {
             return;
         }
 
         let mut to_remove = Vec::new();
         loop {
             let len = self.len().await;
-            let mut cache = self.cache_queue.lock();
+            let mut cache = self.cache_queue.write();
 
             if len < cache.cap() {
                 break;
