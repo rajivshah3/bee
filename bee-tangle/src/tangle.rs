@@ -17,7 +17,7 @@ use std::{
     fmt::Debug,
     marker::PhantomData,
     ops::Deref,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, atomic::{AtomicU64, Ordering}},
 };
 
 const CACHE_LEN: usize = 1_000_000;
@@ -85,8 +85,8 @@ where
     // gtl: RwLock<()>,
     // vertices: TRwLock<HashMap<MessageId, Vertex<T>>>,
     // children: TRwLock<HashMap<MessageId, (HashSet<MessageId>, bool)>>,
-    vertices: HashMap<MessageId, Vertex<T>>,
-    children: HashMap<MessageId, (HashSet<MessageId>, bool)>,
+    vertices: Arc<HashMap<MessageId, Vertex<T>>>,
+    children: Arc<HashMap<MessageId, (HashSet<MessageId>, bool)>>,
 
     pub(crate) cache_counter: AtomicU64,
     pub(crate) cache_queue: TRwLock<LruCache<MessageId, u64>>,
@@ -96,7 +96,7 @@ where
 
 impl<T, H: Hooks<T>> Default for Tangle<T, H>
 where
-    T: Clone,
+    T: Clone + Send + Sync + 'static,
     H: Default,
 {
     fn default() -> Self {
@@ -106,14 +106,14 @@ where
 
 impl<T, H: Hooks<T>> Tangle<T, H>
 where
-    T: Clone,
+    T: Clone + Send + Sync + 'static,
 {
     /// Creates a new Tangle.
     pub fn new(hooks: H) -> Self {
         Self {
             // gtl: RwLock::new(()),
-            vertices: HashMap::new(),
-            children: HashMap::new(),
+            vertices: Arc::new(HashMap::new()),
+            children: Arc::new(HashMap::new()),
 
             cache_counter: AtomicU64::new(0),
             cache_queue: TRwLock::new(LruCache::new(CACHE_LEN + 1)),
@@ -409,9 +409,10 @@ where
             return;
         }
 
+        let mut cache = self.cache_queue.write().await;
+        let mut to_remove = Vec::new();
         loop {
             let len = self.len().await;
-            let mut cache = self.cache_queue.write().await;
 
             if len < cache.cap() {
                 break;
@@ -424,16 +425,22 @@ where
                 None
             };
 
-            drop(cache);
-
             if let Some(message_id) = remove {
-                self.vertices
+                to_remove.push(message_id);
+            }
+        }
+
+        let vertices = self.vertices.clone();
+        let children = self.children.clone();
+        tokio::task::spawn(async move {
+            for message_id in to_remove {
+                vertices
                     .remove(&message_id)
                     .await
                     .expect("Expected vertex entry to exist");
-                self.children.remove(&message_id).await;
+                children.remove(&message_id).await;
             }
-        }
+        });
     }
 }
 
