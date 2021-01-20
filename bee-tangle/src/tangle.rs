@@ -10,15 +10,17 @@ use async_trait::async_trait;
 // use dashmap::{mapref::entry::Entry, DashMap};
 use log::info;
 use lru::LruCache;
-use tokio::sync::{Mutex, RwLock as TRwLock, RwLockReadGuard as TRwLockReadGuard};
+use tokio::sync::{RwLock as TRwLock, RwLockReadGuard as TRwLockReadGuard};
+use spin::Mutex;
 
 use std::{
-    collections::HashSet,
+    // collections::HashSet,
     fmt::Debug,
     marker::PhantomData,
     ops::Deref,
     sync::{Arc, atomic::{AtomicU64, Ordering}},
 };
+use hashbrown::HashSet;
 
 const CACHE_LEN: usize = 1_000_000;
 
@@ -89,7 +91,7 @@ where
     children: Arc<HashMap<MessageId, (HashSet<MessageId>, bool)>>,
 
     pub(crate) cache_counter: AtomicU64,
-    pub(crate) cache_queue: TRwLock<LruCache<MessageId, u64>>,
+    pub(crate) cache_queue: Mutex<LruCache<MessageId, u64>>,
 
     pub(crate) hooks: H,
 }
@@ -116,7 +118,7 @@ where
             children: Arc::new(HashMap::new()),
 
             cache_counter: AtomicU64::new(0),
-            cache_queue: TRwLock::new(LruCache::new(CACHE_LEN + 1)),
+            cache_queue: Mutex::new(LruCache::new(CACHE_LEN + 1)),
 
             hooks,
         }
@@ -125,7 +127,7 @@ where
     /// Create a new tangle with the given capacity.
     pub fn with_capacity(self, cap: usize) -> Self {
         Self {
-            cache_queue: TRwLock::new(LruCache::new(cap + 1)),
+            cache_queue: Mutex::new(LruCache::new(cap + 1)),
             ..self
         }
     }
@@ -144,8 +146,7 @@ where
         if self.vertices.insert(message_id, vtx).await.is_none() {
             // Insert cache queue entry to track eviction priority
             self.cache_queue
-                .write()
-                .await
+                .lock()
                 .put(message_id, self.generate_cache_index());
 
             self.add_children_inner(&parents, message_id).await;
@@ -200,7 +201,7 @@ where
         let res = self.vertices.get(message_id).await;
 
         if res.is_some() {
-            let mut cache_queue = self.cache_queue.write().await;
+            let mut cache_queue = self.cache_queue.lock();
             // Update message_id priority
             let entry = cache_queue.get_mut(message_id);
             let entry = if entry.is_none() {
@@ -405,14 +406,14 @@ where
     async fn perform_eviction(&self) {
         const CACHE_THRESHOLD: usize = 1024;
 
-        if self.len().await < self.cache_queue.read().await.cap() + CACHE_THRESHOLD {
+        if self.len().await < self.cache_queue.lock().cap() + CACHE_THRESHOLD {
             return;
         }
 
-        let mut cache = self.cache_queue.write().await;
         let mut to_remove = Vec::new();
         loop {
             let len = self.len().await;
+            let mut cache = self.cache_queue.lock();
 
             if len < cache.cap() {
                 break;
@@ -424,6 +425,7 @@ where
             } else {
                 None
             };
+            drop(cache);
 
             if let Some(message_id) = remove {
                 to_remove.push(message_id);
