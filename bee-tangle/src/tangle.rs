@@ -158,9 +158,9 @@ where
 
     /// Inserts a message, and returns a thread-safe reference to it in case it didn't already exist.
     pub async fn insert(&self, message_id: MessageId, message: Message, metadata: T) -> Option<MessageRef> {
-        if self.contains_inner(&message_id).await {
-            None
-        } else {
+        // if self.contains_inner(&message_id).await {
+        //     None
+        // } else {
             // let _gtl_guard = self.gtl.write().await;
 
             // Insert into backend using hooks
@@ -170,7 +170,7 @@ where
                 .unwrap_or_else(|e| info!("Failed to insert message {:?}", e));
 
             self.insert_inner(message_id, message, metadata).await
-        }
+        // }
     }
 
     #[inline]
