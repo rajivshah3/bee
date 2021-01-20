@@ -547,11 +547,13 @@ dependencies = [
  "bitflags",
  "criterion",
  "dashmap",
+ "hashbrown",
  "log",
  "lru",
  "pollster",
  "rand 0.8.2",
  "serde",
+ "spin 0.7.0",
  "thiserror",
  "tokio",
 ]

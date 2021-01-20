@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{vertex::Vertex, MessageRef};
+use crate::shashmap::HashMap;
 
 use bee_message::{Message, MessageId};
 
@@ -12,7 +13,7 @@ use lru::LruCache;
 use tokio::sync::{Mutex, RwLock as TRwLock, RwLockReadGuard as TRwLockReadGuard};
 
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::HashSet,
     fmt::Debug,
     marker::PhantomData,
     ops::Deref,
@@ -82,8 +83,10 @@ where
 {
     // Global Tangle Lock. Remove this as and when it is deemed correct to do so.
     // gtl: RwLock<()>,
-    vertices: TRwLock<HashMap<MessageId, Vertex<T>>>,
-    children: TRwLock<HashMap<MessageId, (HashSet<MessageId>, bool)>>,
+    // vertices: TRwLock<HashMap<MessageId, Vertex<T>>>,
+    // children: TRwLock<HashMap<MessageId, (HashSet<MessageId>, bool)>>,
+    vertices: HashMap<MessageId, Vertex<T>>,
+    children: HashMap<MessageId, (HashSet<MessageId>, bool)>,
 
     pub(crate) cache_counter: AtomicU64,
     pub(crate) cache_queue: Mutex<LruCache<MessageId, u64>>,
@@ -109,8 +112,8 @@ where
     pub fn new(hooks: H) -> Self {
         Self {
             // gtl: RwLock::new(()),
-            vertices: TRwLock::new(HashMap::new()),
-            children: TRwLock::new(HashMap::new()),
+            vertices: HashMap::new(),
+            children: HashMap::new(),
 
             cache_counter: AtomicU64::new(0),
             cache_queue: Mutex::new(LruCache::new(CACHE_LEN + 1)),
@@ -135,18 +138,10 @@ where
     async fn insert_inner(&self, message_id: MessageId, message: Message, metadata: T) -> Option<MessageRef> {
         let parents = [*message.parent1(), *message.parent2()];
 
-        let (r, inserted) = match self.vertices.write().await.entry(message_id) {
-            Entry::Occupied(_) => (None, false),
-            Entry::Vacant(entry) => {
-                let vtx = Vertex::new(message, metadata);
-                let tx = vtx.message().clone();
-                entry.insert(vtx);
+        let vtx = Vertex::new(message, metadata);
+        let tx = vtx.message().clone();
 
-                (Some(tx), true)
-            }
-        };
-
-        if inserted {
+        if self.vertices.insert(message_id, vtx).await.is_none() {
             // Insert cache queue entry to track eviction priority
             self.cache_queue
                 .lock()
@@ -158,7 +153,7 @@ where
 
         self.perform_eviction().await;
 
-        r
+        Some(tx)
     }
 
     /// Inserts a message, and returns a thread-safe reference to it in case it didn't already exist.
@@ -180,15 +175,13 @@ where
 
     #[inline]
     async fn add_children_inner(&self, parents: &[MessageId], child: MessageId) {
-        let mut children_map = self.children.write().await;
         for &parent in parents {
-            let children = children_map
-                .entry(parent)
-                .or_insert_with(|| (HashSet::default(), false));
-            children.0.insert(child);
+            if self.children.do_for_mut(&parent, |map| map.0.insert(child)).await.is_none() {
+                let mut set = HashSet::new();
+                set.insert(child);
+                self.children.insert(parent, (set, false));
+            }
         }
-
-        drop(children_map);
 
         for &parent in parents {
             self.hooks
@@ -203,7 +196,7 @@ where
     }
 
     async fn get_inner(&self, message_id: &MessageId) -> Option<impl Deref<Target = Vertex<T>> + '_> {
-        let res = TRwLockReadGuard::try_map(self.vertices.read().await, |m| m.get(message_id)).ok();
+        let res = self.vertices.get(message_id).await;
 
         if res.is_some() {
             let mut cache_queue = self.cache_queue.lock().await;
@@ -229,7 +222,7 @@ where
     }
 
     async fn contains_inner(&self, message_id: &MessageId) -> bool {
-        self.vertices.read().await.contains_key(message_id)
+        self.vertices.contains_key(message_id).await
     }
 
     /// Returns whether the message is stored in the Tangle.
@@ -254,12 +247,16 @@ where
     /// Updates the metadata of a particular vertex.
     pub async fn set_metadata(&self, message_id: &MessageId, metadata: T) {
         self.pull_message(message_id).await;
-        if let Some(vtx) = self.vertices.write().await.get_mut(message_id) {
+        if let Some(mut vtx) = self.vertices.get_cloned(message_id).await {
             // let _gtl_guard = self.gtl.write().await;
 
             *vtx.metadata_mut() = metadata;
+
+            let message = (&**vtx.message()).clone();
+            let metadata = vtx.metadata().clone();
+            self.vertices.insert(*message_id, vtx).await;
             self.hooks
-                .insert(*message_id, (&**vtx.message()).clone(), vtx.metadata().clone())
+                .insert(*message_id, message, metadata)
                 .await
                 .unwrap_or_else(|e| info!("Failed to update metadata for message {:?}", e));
         }
@@ -271,12 +268,16 @@ where
         Update: FnMut(&mut T),
     {
         self.pull_message(message_id).await;
-        if let Some(vtx) = self.vertices.write().await.get_mut(message_id) {
+        if let Some(mut vtx) = self.vertices.get_cloned(message_id).await {
             // let _gtl_guard = self.gtl.write().await;
 
             update(vtx.metadata_mut());
+
+            let message = (&**vtx.message()).clone();
+            let metadata = vtx.metadata().clone();
+            self.vertices.insert(*message_id, vtx).await;
             self.hooks
-                .insert(*message_id, (&**vtx.message()).clone(), vtx.metadata().clone())
+                .insert(*message_id, message, metadata)
                 .await
                 .unwrap_or_else(|e| info!("Failed to update metadata for message {:?}", e));
         }
@@ -285,7 +286,7 @@ where
     /// Returns the number of messages in the Tangle.
     pub async fn len(&self) -> usize {
         // Does not take GTL because this is effectively atomic
-        self.vertices.read().await.len()
+        self.vertices.len().await
     }
 
     /// Checks if the tangle is empty.
@@ -319,16 +320,15 @@ where
             }
         }
 
-        let children_map = self.children.read().await;
-        let children = children_map
-            .get(message_id)
+        let children = self.children
+            .get_cloned(message_id)
+            .await
             // Skip approver lists that are not exhaustive
             .filter(|children| children.1);
 
         let children = match children {
-            Some(children) => children.0.clone(),
+            Some(children) => children.0,
             None => {
-                drop(children_map);
                 // let _gtl_guard = self.gtl.write().await;
 
                 let to_insert = match self.hooks.fetch_approvers(message_id).await {
@@ -341,17 +341,14 @@ where
                 };
 
                 self.children
-                    .write()
-                    .await
-                    .insert(*message_id, (to_insert.into_iter().collect(), true));
+                    .insert(*message_id, (to_insert.into_iter().collect(), true))
+                    .await;
 
                 self.children
-                    .read()
+                    .get_cloned(message_id)
                     .await
-                    .get(message_id)
                     .expect("Approver list inserted and immediately evicted")
                     .0
-                    .clone()
             }
         };
 
@@ -386,7 +383,7 @@ where
     // Attempts to pull the message from the storage, returns true if successful.
     async fn pull_message(&self, message_id: &MessageId) -> bool {
         // If the tangle already contains the tx, do no more work
-        if self.vertices.read().await.contains_key(message_id) {
+        if self.vertices.contains_key(message_id).await {
             true
         } else {
             // let _gtl_guard = self.gtl.write().await;
@@ -424,11 +421,10 @@ where
 
             if let Some(message_id) = remove {
                 self.vertices
-                    .write()
-                    .await
                     .remove(&message_id)
+                    .await
                     .expect("Expected vertex entry to exist");
-                self.children.write().await.remove(&message_id);
+                self.children.remove(&message_id).await;
             }
         }
     }
