@@ -162,14 +162,15 @@ where
         //     None
         // } else {
             // let _gtl_guard = self.gtl.write().await;
+            let r = self.insert_inner(message_id, message.clone(), metadata.clone()).await;
 
             // Insert into backend using hooks
             self.hooks
-                .insert(message_id, message.clone(), metadata.clone())
+                .insert(message_id, message, metadata)
                 .await
                 .unwrap_or_else(|e| info!("Failed to insert message {:?}", e));
 
-            self.insert_inner(message_id, message, metadata).await
+            r
         // }
     }
 
@@ -179,7 +180,7 @@ where
             if self.children.do_for_mut(&parent, |map| map.0.insert(child)).await.is_none() {
                 let mut set = HashSet::new();
                 set.insert(child);
-                self.children.insert(parent, (set, false));
+                self.children.insert(parent, (set, false)).await;
             }
         }
 
