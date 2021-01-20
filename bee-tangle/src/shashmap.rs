@@ -7,7 +7,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use hashbrown::{HashMap as InnerHashMap, hash_map::Entry};
-use hashbrown::hash_map::DefaultHashBuilder as RandomState;
+use fxhash::FxBuildHasher as RandomState;
 use spin::{Once, /*RwLock*/};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
