@@ -8,7 +8,7 @@ use crate::{
 };
 
 use bee_message::MessageId;
-use bee_runtime::{event::Bus, node::Node, shutdown_stream::ShutdownStream, worker::Worker};
+use bee_runtime::{event::Bus, node::Node, resource::ResourceHandle, shutdown_stream::ShutdownStream, worker::Worker};
 use bee_tangle::MsTangle;
 
 use async_trait::async_trait;
@@ -32,76 +32,96 @@ pub(crate) struct PropagatorWorker {
 
 async fn propagate<B: StorageBackend>(
     message_id: MessageId,
-    tangle: &MsTangle<B>,
-    bus: &Bus<'static>,
+    tangle: &ResourceHandle<MsTangle<B>>,
+    bus: &ResourceHandle<Bus<'static>>,
     milestone_solidifier: &mpsc::UnboundedSender<MilestoneSolidifierWorkerEvent>,
 ) {
-    let mut children = vec![message_id];
+    let (tx, rx) = async_channel::unbounded();
 
-    while let Some(ref message_id) = children.pop() {
-        if tangle.is_solid_message(message_id).await {
-            continue;
-        }
+    tx.send(message_id).await;
 
-        // TODO Copying parents to avoid double locking, will be refactored.
-        if let Some((parent1, parent2)) = tangle
-            .get(&message_id)
-            .await
-            .map(|message| (*message.parent1(), *message.parent2()))
-        {
-            if !tangle.is_solid_message(&parent1).await || !tangle.is_solid_message(&parent2).await {
-                continue;
-            }
+    const WORKER: usize = 8;
 
-            // get OTRSI/YTRSI from parents
-            let parent1_otsri = tangle.otrsi(&parent1).await;
-            let parent2_otsri = tangle.otrsi(&parent2).await;
-            let parent1_ytrsi = tangle.ytrsi(&parent1).await;
-            let parent2_ytrsi = tangle.ytrsi(&parent2).await;
+    let mut futures = Vec::new();
 
-            // get best OTRSI/YTRSI from parents
-            // unwrap() is safe because parents are solid which implies that OTRSI/YTRSI values are
-            // available.
-            let best_otrsi = max(parent1_otsri.unwrap(), parent2_otsri.unwrap());
-            let best_ytrsi = min(parent1_ytrsi.unwrap(), parent2_ytrsi.unwrap());
+    for _ in 0..WORKER {
+        let tangle = tangle.clone();
+        let bus = bus.clone();
+        let milestone_solidifier = milestone_solidifier.clone();
+        let tx = tx.clone();
+        let rx = rx.clone();
 
-            tangle
-                .update_metadata(&message_id, |metadata| {
-                    // OTRSI/YTRSI values need to be set before the solid flag, to ensure that the
-                    // MilestoneConeUpdater is aware of all values.
-                    metadata.set_otrsi(best_otrsi);
-                    metadata.set_ytrsi(best_ytrsi);
-                    metadata.solidify();
-                })
-                .await;
+        futures.push(tokio::task::spawn(async move {
+            while let Ok(ref message_id) = rx.recv().await {
+                if tangle.is_solid_message(message_id).await {
+                    continue;
+                }
 
-            let index = match tangle.get_metadata(&message_id).await {
-                Some(meta) => {
-                    if meta.flags().is_milestone() {
-                        Some(meta.milestone_index())
-                    } else {
-                        None
+                // TODO Copying parents to avoid double locking, will be refactored.
+                if let Some((parent1, parent2)) = tangle
+                    .get(&message_id)
+                    .await
+                    .map(|message| (*message.parent1(), *message.parent2()))
+                {
+                    if !tangle.is_solid_message(&parent1).await || !tangle.is_solid_message(&parent2).await {
+                        continue;
                     }
-                }
-                None => None,
-            };
 
-            if let Some(index) = index {
-                if let Err(e) = milestone_solidifier.send(MilestoneSolidifierWorkerEvent(index)) {
-                    error!("Sending solidification event failed: {}.", e);
+                    // get OTRSI/YTRSI from parents
+                    let parent1_otsri = tangle.otrsi(&parent1).await;
+                    let parent2_otsri = tangle.otrsi(&parent2).await;
+                    let parent1_ytrsi = tangle.ytrsi(&parent1).await;
+                    let parent2_ytrsi = tangle.ytrsi(&parent2).await;
+
+                    // get best OTRSI/YTRSI from parents
+                    // unwrap() is safe because parents are solid which implies that OTRSI/YTRSI values are
+                    // available.
+                    let best_otrsi = max(parent1_otsri.unwrap(), parent2_otsri.unwrap());
+                    let best_ytrsi = min(parent1_ytrsi.unwrap(), parent2_ytrsi.unwrap());
+
+                    tangle
+                        .update_metadata(&message_id, |metadata| {
+                            // OTRSI/YTRSI values need to be set before the solid flag, to ensure that the
+                            // MilestoneConeUpdater is aware of all values.
+                            metadata.set_otrsi(best_otrsi);
+                            metadata.set_ytrsi(best_ytrsi);
+                            metadata.solidify();
+                        })
+                        .await;
+
+                    let index = match tangle.get_metadata(&message_id).await {
+                        Some(meta) => {
+                            if meta.flags().is_milestone() {
+                                Some(meta.milestone_index())
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    };
+
+                    if let Some(index) = index {
+                        if let Err(e) = milestone_solidifier.send(MilestoneSolidifierWorkerEvent(index)) {
+                            error!("Sending solidification event failed: {}.", e);
+                        }
+                    }
+
+                    if let Some(msg_children) = tangle.get_children(&message_id).await {
+                        for child in msg_children {
+                            tx.send(child).await;
+                        }
+                    }
+
+                    bus.dispatch(MessageSolidified(*message_id));
+
+                    tangle.insert_tip(*message_id, parent1, parent2).await;
                 }
             }
+        }));
+    }
 
-            if let Some(msg_children) = tangle.get_children(&message_id).await {
-                for child in msg_children {
-                    children.push(child);
-                }
-            }
-
-            bus.dispatch(MessageSolidified(*message_id));
-
-            tangle.insert_tip(*message_id, parent1, parent2).await;
-        }
+    for f in futures {
+        f.await;
     }
 }
 
@@ -130,7 +150,7 @@ where
             let mut receiver = ShutdownStream::new(shutdown, UnboundedReceiverStream::new(rx));
 
             while let Some(PropagatorWorkerEvent(message_id)) = receiver.next().await {
-                propagate(message_id, &tangle, &*bus, &milestone_solidifier).await;
+                propagate(message_id, &tangle, &bus, &milestone_solidifier).await;
             }
 
             // let (_, mut receiver) = receiver.split();
