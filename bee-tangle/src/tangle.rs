@@ -78,6 +78,28 @@ impl<T: Send + Sync> Hooks<T> for NullHooks<T> {
     }
 }
 
+static TANGLE_MUTATIONS: spin::Mutex<Option<std::collections::HashMap<std::panic::Location, usize>>> = spin::Mutex::new(None);
+
+#[track_caller]
+pub fn register_mut() {
+    let loc = std::panic::Location::caller();
+    *TANGLE_MUTATIONS
+        .lock()
+        .get_or_insert_with(|| Default::default())
+        .entry(*loc)
+        .or_default() += 1;
+}
+
+pub fn report_muts() {
+    TANGLE_MUTATIONS.lock().as_ref().map(|map| {
+        let mut locs = map.iter().map(|(a, b)| (*a, *b)).collect::<Vec<_>>();
+        locs.sort_by_key(|(_, count)| *count);
+        for (loc, count) in locs {
+            println!("{} => {}", count, loc);
+        }
+    });
+}
+
 /// A foundational, thread-safe graph datastructure to represent the IOTA Tangle.
 pub struct Tangle<T, H = NullHooks<T>>
 where
@@ -160,7 +182,9 @@ where
     }
 
     /// Inserts a message, and returns a thread-safe reference to it in case it didn't already exist.
+    #[track_caller]
     pub async fn insert(&self, message_id: MessageId, message: Message, metadata: T) -> Option<MessageRef> {
+        register_mut();
         // if self.contains_inner(&message_id).await {
         //     None
         // } else {
@@ -250,7 +274,9 @@ where
     }
 
     /// Updates the metadata of a particular vertex.
+    #[track_caller]
     pub async fn set_metadata(&self, message_id: &MessageId, metadata: T) {
+        register_mut();
         self.pull_message(message_id).await;
         if let Some(mut vtx) = self.vertices.get_cloned(message_id).await {
             // let _gtl_guard = self.gtl.write().await;
@@ -268,10 +294,12 @@ where
     }
 
     /// Updates the metadata of a vertex.
+    #[track_caller]
     pub async fn update_metadata<Update>(&self, message_id: &MessageId, mut update: Update)
     where
         Update: FnMut(&mut T),
     {
+        register_mut();
         self.pull_message(message_id).await;
         if let Some(mut vtx) = self.vertices.get_cloned(message_id).await {
             // let _gtl_guard = self.gtl.write().await;

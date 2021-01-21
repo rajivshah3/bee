@@ -560,6 +560,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bee-tangle2"
+version = "0.1.0-alpha"
+dependencies = [
+ "bee-message",
+]
+
+[[package]]
 name = "bee-ternary"
 version = "0.4.0-alpha"
 source = "git+https://github.com/iotaledger/bee.git?branch=dev#8cdfe505e3e5a699655d2c43c4305fb109ec8c87"
