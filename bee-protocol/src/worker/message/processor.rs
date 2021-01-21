@@ -83,125 +83,147 @@ where
             let mut latency_sum: u64 = 0;
             let mut receiver = ShutdownStream::new(shutdown, UnboundedReceiverStream::new(rx));
 
-            while let Some(ProcessorWorkerEvent {
-                pow_score,
-                from,
-                message_packet,
-                notifier,
-            }) = receiver.next().await
-            {
-                trace!("Processing received message...");
+            let (tx, rx) = async_channel::bounded(1024);
 
-                let message = match Message::unpack(&mut &message_packet.bytes[..]) {
-                    Ok(message) => message,
-                    Err(e) => {
-                        invalid_message(format!("Invalid message: {:?}.", e), &metrics, notifier);
-                        continue;
-                    }
-                };
+            const WORKER: usize = 8;
 
-                if message.network_id() != config.1 {
-                    invalid_message(
-                        format!("Incompatible network ID {} != {}.", message.network_id(), config.1),
-                        &metrics,
+            for _ in 0..WORKER {
+                let rx = rx.clone();
+                let tangle = tangle.clone();
+                let metrics = metrics.clone();
+                let config = config.clone();
+                let requested_messages = requested_messages.clone();
+                let peer_manager = peer_manager.clone();
+                let bus = bus.clone();
+                let propagator = propagator.clone();
+                let message_requester = message_requester.clone();
+                let broadcaster = broadcaster.clone();
+                let payload_worker = payload_worker.clone();
+                tokio::task::spawn(async move {
+                    while let Ok(ProcessorWorkerEvent {
+                        pow_score,
+                        from,
+                        message_packet,
                         notifier,
-                    );
-                    continue;
-                }
+                    }) = rx.recv().await {
+                        trace!("Processing received message...");
 
-                if pow_score < config.0.minimum_pow_score {
-                    invalid_message(
-                        format!(
-                            "Insufficient pow score: {} < {}.",
-                            pow_score, config.0.minimum_pow_score
-                        ),
-                        &metrics,
-                        notifier,
-                    );
-                    continue;
-                }
+                        let message = match Message::unpack(&mut &message_packet.bytes[..]) {
+                            Ok(message) => message,
+                            Err(e) => {
+                                invalid_message(format!("Invalid message: {:?}.", e), &metrics, notifier);
+                                continue;
+                            }
+                        };
 
-                // TODO should be passed by the hasher worker ?
-                let (message_id, _) = message.id();
-                let requested = requested_messages.contains(&message_id).await;
+                        if message.network_id() != config.1 {
+                            invalid_message(
+                                format!("Incompatible network ID {} != {}.", message.network_id(), config.1),
+                                &metrics,
+                                notifier,
+                            );
+                            continue;
+                        }
 
-                let mut metadata = MessageMetadata::arrived();
-                metadata.flags_mut().set_requested(requested);
+                        if pow_score < config.0.minimum_pow_score {
+                            invalid_message(
+                                format!(
+                                    "Insufficient pow score: {} < {}.",
+                                    pow_score, config.0.minimum_pow_score
+                                ),
+                                &metrics,
+                                notifier,
+                            );
+                            continue;
+                        }
 
-                let parent1 = *message.parent1();
-                let parent2 = *message.parent2();
+                        // TODO should be passed by the hasher worker ?
+                        let (message_id, _) = message.id();
+                        let requested = requested_messages.contains(&message_id).await;
 
-                // store message
-                let inserted = tangle.insert(message, message_id, metadata).await.is_some();
+                        let mut metadata = MessageMetadata::arrived();
+                        metadata.flags_mut().set_requested(requested);
 
-                if !inserted {
-                    metrics.known_messages_inc();
-                    if let Some(ref peer_id) = from {
-                        peer_manager
-                            .get(&peer_id)
-                            .await
-                            .map(|peer| (*peer).0.metrics().known_messages_inc());
+                        let parent1 = *message.parent1();
+                        let parent2 = *message.parent2();
+
+                        // store message
+                        let inserted = tangle.insert(message, message_id, metadata).await.is_some();
+
+                        if !inserted {
+                            metrics.known_messages_inc();
+                            if let Some(ref peer_id) = from {
+                                peer_manager
+                                    .get(&peer_id)
+                                    .await
+                                    .map(|peer| (*peer).0.metrics().known_messages_inc());
+                            }
+                            continue;
+                        }
+
+                        bus.dispatch(MessageProcessed(message_id));
+
+                        // TODO: boolean values are false at this point in time? trigger event from another location?
+                        bus.dispatch(NewVertex {
+                            id: message_id.to_string(),
+                            parent1_id: parent1.to_string(),
+                            parent2_id: parent2.to_string(),
+                            is_solid: false,
+                            is_referenced: false,
+                            is_conflicting: false,
+                            is_milestone: false,
+                            is_tip: false,
+                            is_selected: false,
+                        });
+
+                        if let Err(e) = propagator.send(PropagatorWorkerEvent(message_id)) {
+                            error!("Failed to send message id {} to propagator: {:?}.", message_id, e);
+                        }
+
+                        metrics.new_messages_inc();
+
+                        match requested_messages.remove(&message_id).await {
+                            Some((index, instant)) => {
+                                // Message was requested.
+
+                                latency_num += 1;
+                                latency_sum += (Instant::now() - instant).as_millis() as u64;
+                                metrics.messages_average_latency_set(latency_sum / latency_num);
+
+                                helper::request_message(&tangle, &message_requester, &*requested_messages, parent1, index)
+                                    .await;
+                                if parent1 != parent2 {
+                                    helper::request_message(&tangle, &message_requester, &*requested_messages, parent2, index)
+                                        .await;
+                                }
+                            }
+                            None => {
+                                // Message was not requested.
+                                if let Err(e) = broadcaster.send(BroadcasterWorkerEvent {
+                                    source: from,
+                                    message: message_packet,
+                                }) {
+                                    warn!("Broadcasting message failed: {}.", e);
+                                }
+                            }
+                        };
+
+                        if let Err(e) = payload_worker.send(PayloadWorkerEvent(message_id)) {
+                            warn!("Sending message id {} to payload worker failed: {:?}.", message_id, e);
+                        } else {
+                        }
+
+                        if let Some(notifier) = notifier {
+                            if let Err(e) = notifier.send(Ok(message_id)) {
+                                error!("Failed to send message id: {:?}.", e);
+                            }
+                        }
                     }
-                    continue;
-                }
-
-                bus.dispatch(MessageProcessed(message_id));
-
-                // TODO: boolean values are false at this point in time? trigger event from another location?
-                bus.dispatch(NewVertex {
-                    id: message_id.to_string(),
-                    parent1_id: parent1.to_string(),
-                    parent2_id: parent2.to_string(),
-                    is_solid: false,
-                    is_referenced: false,
-                    is_conflicting: false,
-                    is_milestone: false,
-                    is_tip: false,
-                    is_selected: false,
                 });
+            }
 
-                if let Err(e) = propagator.send(PropagatorWorkerEvent(message_id)) {
-                    error!("Failed to send message id {} to propagator: {:?}.", message_id, e);
-                }
-
-                metrics.new_messages_inc();
-
-                match requested_messages.remove(&message_id).await {
-                    Some((index, instant)) => {
-                        // Message was requested.
-
-                        latency_num += 1;
-                        latency_sum += (Instant::now() - instant).as_millis() as u64;
-                        metrics.messages_average_latency_set(latency_sum / latency_num);
-
-                        helper::request_message(&tangle, &message_requester, &*requested_messages, parent1, index)
-                            .await;
-                        if parent1 != parent2 {
-                            helper::request_message(&tangle, &message_requester, &*requested_messages, parent2, index)
-                                .await;
-                        }
-                    }
-                    None => {
-                        // Message was not requested.
-                        if let Err(e) = broadcaster.send(BroadcasterWorkerEvent {
-                            source: from,
-                            message: message_packet,
-                        }) {
-                            warn!("Broadcasting message failed: {}.", e);
-                        }
-                    }
-                };
-
-                if let Err(e) = payload_worker.send(PayloadWorkerEvent(message_id)) {
-                    warn!("Sending message id {} to payload worker failed: {:?}.", message_id, e);
-                } else {
-                }
-
-                if let Some(notifier) = notifier {
-                    if let Err(e) = notifier.send(Ok(message_id)) {
-                        error!("Failed to send message id: {:?}.", e);
-                    }
-                }
+            while let Some(event) = receiver.next().await {
+                tx.send(event).await.unwrap_or_else(|e| error!("Failed to send to processor worker: {:?}", e));
             }
 
             info!("Stopped.");
