@@ -19,6 +19,7 @@ use std::{
     marker::PhantomData,
     ops::Deref,
     sync::{Arc, atomic::{AtomicU64, Ordering}},
+    future::Future,
 };
 use hashbrown::HashSet;
 
@@ -183,8 +184,9 @@ where
 
     /// Inserts a message, and returns a thread-safe reference to it in case it didn't already exist.
     #[track_caller]
-    pub async fn insert(&self, message_id: MessageId, message: Message, metadata: T) -> Option<MessageRef> {
+    pub fn insert(&self, message_id: MessageId, message: Message, metadata: T) -> impl Future<Output = Option<MessageRef>> + '_ {
         register_mut();
+        async move {
         // if self.contains_inner(&message_id).await {
         //     None
         // } else {
@@ -199,6 +201,7 @@ where
 
             r
         // }
+        }
     }
 
     #[inline]
@@ -275,8 +278,9 @@ where
 
     /// Updates the metadata of a particular vertex.
     #[track_caller]
-    pub async fn set_metadata(&self, message_id: &MessageId, metadata: T) {
+    pub fn set_metadata<'a>(&'a self, message_id: &'a MessageId, metadata: T) -> impl Future + 'a {
         register_mut();
+        async move {
         self.pull_message(message_id).await;
         if let Some(mut vtx) = self.vertices.get_cloned(message_id).await {
             // let _gtl_guard = self.gtl.write().await;
@@ -291,28 +295,31 @@ where
                 .await
                 .unwrap_or_else(|e| info!("Failed to update metadata for message {:?}", e));
         }
+        }
     }
 
     /// Updates the metadata of a vertex.
     #[track_caller]
-    pub async fn update_metadata<Update>(&self, message_id: &MessageId, mut update: Update)
+    pub fn update_metadata<'a, Update: 'a>(&'a self, message_id: &'a MessageId, mut update: Update) -> impl Future + 'a
     where
         Update: FnMut(&mut T),
     {
         register_mut();
-        self.pull_message(message_id).await;
-        if let Some(mut vtx) = self.vertices.get_cloned(message_id).await {
-            // let _gtl_guard = self.gtl.write().await;
+        async move {
+            self.pull_message(message_id).await;
+            if let Some(mut vtx) = self.vertices.get_cloned(message_id).await {
+                // let _gtl_guard = self.gtl.write().await;
 
-            update(vtx.metadata_mut());
+                update(vtx.metadata_mut());
 
-            let message = (&**vtx.message()).clone();
-            let metadata = vtx.metadata().clone();
-            self.vertices.insert(*message_id, vtx).await;
-            self.hooks
-                .insert(*message_id, message, metadata)
-                .await
-                .unwrap_or_else(|e| info!("Failed to update metadata for message {:?}", e));
+                let message = (&**vtx.message()).clone();
+                let metadata = vtx.metadata().clone();
+                self.vertices.insert(*message_id, vtx).await;
+                self.hooks
+                    .insert(*message_id, message, metadata)
+                    .await
+                    .unwrap_or_else(|e| info!("Failed to update metadata for message {:?}", e));
+            }
         }
     }
 
