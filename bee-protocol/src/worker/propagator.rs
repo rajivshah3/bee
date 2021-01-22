@@ -40,7 +40,7 @@ async fn propagate<B: StorageBackend>(
 
     tx.send(message_id).await;
 
-    const WORKER: usize = 8;
+    const WORKER: usize = 1;
 
     let mut futures = Vec::new();
 
