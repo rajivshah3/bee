@@ -300,9 +300,9 @@ where
 
     /// Updates the metadata of a vertex.
     #[track_caller]
-    pub fn update_metadata<'a, Update: 'a>(&'a self, message_id: &'a MessageId, mut update: Update) -> impl Future + 'a
+    pub fn update_metadata<'a, Update: 'a, R>(&'a self, message_id: &'a MessageId, mut update: Update) -> impl Future<Output = Option<R>> + 'a
     where
-        Update: FnMut(&mut T),
+        Update: FnMut(&mut T) -> R,
     {
         register_mut();
         async move {
@@ -310,7 +310,7 @@ where
             if let Some(mut vtx) = self.vertices.get_cloned(message_id).await {
                 // let _gtl_guard = self.gtl.write().await;
 
-                update(vtx.metadata_mut());
+                let r = update(vtx.metadata_mut());
 
                 let message = (&**vtx.message()).clone();
                 let metadata = vtx.metadata().clone();
@@ -319,6 +319,10 @@ where
                     .insert(*message_id, message, metadata)
                     .await
                     .unwrap_or_else(|e| info!("Failed to update metadata for message {:?}", e));
+
+                Some(r)
+            } else {
+                None
             }
         }
     }
